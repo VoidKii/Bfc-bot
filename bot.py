@@ -45,10 +45,20 @@ if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
 
 
 # =========================================================
-# FAKE WEB SERVER FOR RENDER
+# FLASK WEB SERVER FOR RENDER + DASHBOARD
 # =========================================================
 
-app = Flask(__name__, template_folder="templates")
+# Use absolute paths for Flask to work correctly on Render
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_DIR = os.path.join(SCRIPT_DIR, "templates")
+STATIC_DIR = os.path.join(SCRIPT_DIR, "static")
+
+app = Flask(
+    __name__,
+    template_folder=TEMPLATES_DIR,
+    static_folder=STATIC_DIR,
+    static_url_path="/static"
+)
 app.config["SECRET_KEY"] = SESSION_SECRET
 app.config["SESSION_TYPE"] = "filesystem"
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)
