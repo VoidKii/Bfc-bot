@@ -2,88 +2,68 @@ import os
 import json
 import random
 import asyncio
+import threading
 import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from flask import Flask
 
 
-# ============================================================
-# BFC BOT — VERSION 1.1
-# ============================================================
+# =========================================================
+# CONFIG
+# =========================================================
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing from your .env file.")
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-BOT_NAME = "BFC Bot"
-BOT_VERSION = "1.1"
-
-DEFAULT_COLOR = 0x5865F2
-SUCCESS_COLOR = 0x57F287
-ERROR_COLOR = 0xED4245
-WARNING_COLOR = 0xFEE75C
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 DATA_FILE = "bfc_data.json"
 
-
-# ============================================================
-# DATA
-# ============================================================
-
-def default_data():
-    return {
-        "warnings": {},
-        "profiles": {},
-        "bounties": {},
-        "giveaways": {}
-    }
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is missing from .env")
 
 
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return default_data()
+# =========================================================
+# FAKE WEB SERVER FOR RENDER
+# =========================================================
 
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as file:
-            loaded = json.load(file)
-
-        for key, value in default_data().items():
-            if key not in loaded:
-                loaded[key] = value
-
-        return loaded
-
-    except Exception:
-        return default_data()
+app = Flask(__name__)
 
 
-data = load_data()
+@app.route("/")
+def home():
+    return "BFC Bot is online! 🏴‍☠️"
 
 
-def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
+@app.route("/health")
+def health():
+    return "OK"
 
 
-# ============================================================
-# BOT SETUP
-# ============================================================
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
+
+
+# =========================================================
+# INTENTS
+# =========================================================
 
 intents = discord.Intents.default()
+
 intents.members = True
 intents.message_content = True
+
 
 bot = commands.Bot(
     command_prefix="!",
@@ -92,493 +72,449 @@ bot = commands.Bot(
 )
 
 
-# ============================================================
+# =========================================================
+# DATA
+# =========================================================
+
+DEFAULT_DATA = {
+    "warnings": {},
+    "profiles": {},
+    "bounties": {},
+    "giveaways": {}
+}
+
+
+def load_data():
+
+    if not os.path.exists(DATA_FILE):
+
+        save_data(DEFAULT_DATA)
+
+        return DEFAULT_DATA.copy()
+
+    try:
+
+        with open(
+            DATA_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            data = json.load(f)
+
+        for key in DEFAULT_DATA:
+
+            if key not in data:
+                data[key] = {}
+
+        return data
+
+    except Exception:
+
+        return DEFAULT_DATA.copy()
+
+
+def save_data(data):
+
+    with open(
+        DATA_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            indent=4
+        )
+
+
+data = load_data()
+
+
+# =========================================================
 # HELPERS
-# ============================================================
+# =========================================================
 
 def make_embed(
-    title=None,
-    description=None,
-    color=DEFAULT_COLOR,
-    footer=True
+    title,
+    description="",
+    color=discord.Color.blurple()
 ):
-    e = discord.Embed(
+
+    return discord.Embed(
         title=title,
         description=description,
         color=color,
         timestamp=datetime.now(timezone.utc)
     )
 
-    if footer:
-        e.set_footer(text=f"{BOT_NAME} • BFC")
 
-    return e
+def parse_color(value):
+
+    value = value.strip().replace("#", "")
+
+    try:
+
+        return discord.Color(
+            int(value, 16)
+        )
+
+    except Exception:
+
+        return discord.Color.blurple()
 
 
-def is_staff(interaction: discord.Interaction):
-    if not interaction.guild:
-        return False
+def is_staff(member):
 
-    permissions = interaction.user.guild_permissions
+    permissions = member.guild_permissions
 
     return (
         permissions.administrator
         or permissions.manage_guild
         or permissions.moderate_members
+        or permissions.manage_messages
     )
 
 
-async def staff_check(interaction: discord.Interaction):
-    if not is_staff(interaction):
-        await interaction.response.send_message(
-            embed=make_embed(
-                "❌ Permission Denied",
-                "You need Staff permissions to use this command.",
-                ERROR_COLOR
-            ),
-            ephemeral=True
-        )
+def staff_check(interaction):
+
+    if not isinstance(
+        interaction.user,
+        discord.Member
+    ):
+
         return False
 
-    return True
+    return is_staff(interaction.user)
 
 
-def user_key(guild_id, user_id):
-    return f"{guild_id}:{user_id}"
+def user_key(user):
+
+    return str(user.id)
 
 
-def parse_color(color: str):
-    try:
-        color = color.replace("#", "").strip()
+def get_warnings(user_id):
 
-        if len(color) != 6:
-            return None
+    key = str(user_id)
 
-        return int(color, 16)
+    if key not in data["warnings"]:
 
-    except ValueError:
-        return None
+        data["warnings"][key] = []
+
+    return data["warnings"][key]
 
 
-# ============================================================
-# BOT READY
-# ============================================================
+# =========================================================
+# READY
+# =========================================================
 
 @bot.event
 async def on_ready():
 
-    print("=" * 50)
-    print(f"{BOT_NAME} is online!")
-    print(f"Logged in as: {bot.user}")
-    print(f"Servers: {len(bot.guilds)}")
-    print("=" * 50)
+    print("========================================")
+    print(f"Logged in as {bot.user}")
+    print(f"Bot ID: {bot.user.id}")
+    print("========================================")
 
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands.")
+
+        if GUILD_ID:
+
+            guild = discord.Object(
+                id=GUILD_ID
+            )
+
+            bot.tree.copy_global_to(
+                guild=guild
+            )
+
+            synced = await bot.tree.sync(
+                guild=guild
+            )
+
+            print(
+                f"Synced {len(synced)} commands to BFC server."
+            )
+
+        else:
+
+            synced = await bot.tree.sync()
+
+            print(
+                f"Synced {len(synced)} global commands."
+            )
 
     except Exception as error:
-        print(f"Command sync error: {error}")
+
+        print(
+            f"Slash command sync error: {error}"
+        )
 
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name="BFC Community"
+            name="Blox Fruits Community"
         )
     )
 
 
-# ============================================================
-# /PING
-# ============================================================
+# =========================================================
+# PING
+# =========================================================
 
-@bot.tree.command(name="ping", description="Check BFC Bot latency.")
-async def ping(interaction: discord.Interaction):
+@bot.tree.command(
+    name="ping",
+    description="Check the bot's latency."
+)
+async def ping(interaction):
 
-    latency = round(bot.latency * 1000)
-
-    await interaction.response.send_message(
-        embed=make_embed(
-            "🏓 Pong!",
-            f"**Latency:** `{latency}ms`\n"
-            "🟢 **BFC Bot is online**",
-            SUCCESS_COLOR
-        )
+    latency = round(
+        bot.latency * 1000
     )
 
-
-# ============================================================
-# /HELP
-# ============================================================
-
-@bot.tree.command(name="help", description="Show all BFC Bot commands.")
-async def help_command(interaction: discord.Interaction):
-
-    e = make_embed(
-        "🏴 BFC Bot",
-        "**Blox Fruits Community Command Center**\n\n"
-        "### ⚙️ Utility\n"
-        "`/ping` • `/help` • `/serverinfo` • `/userinfo` • `/avatar`\n\n"
-        "### 🛡️ Moderation\n"
-        "`/ban` • `/kick` • `/timeout` • `/warn` • `/warnings`\n"
-        "`/clear` • `/lock` • `/unlock`\n\n"
-        "### 📢 Server Tools\n"
-        "`/embed` • `/announce` • `/say`\n\n"
-        "### 🎉 Community\n"
-        "`/giveaway`\n\n"
-        "### 🏴 BFC\n"
-        "`/profile` • `/setprofile` • `/bounty` • `/verify`",
-        DEFAULT_COLOR
-    )
-
-    e.add_field(
-        name="🤖 Version",
-        value=f"`{BOT_NAME} v{BOT_VERSION}`",
-        inline=False
+    embed = make_embed(
+        "🏓 Pong!",
+        f"Bot latency: **{latency}ms**"
     )
 
     await interaction.response.send_message(
-        embed=e,
-        ephemeral=True
+        embed=embed
     )
 
 
-# ============================================================
-# /SERVERINFO
-# ============================================================
+# =========================================================
+# HELP
+# =========================================================
+
+@bot.tree.command(
+    name="help",
+    description="Show all BFC Bot commands."
+)
+async def help_command(interaction):
+
+    embed = make_embed(
+        "⚡ BFC Bot Commands",
+        "Everything available in the BFC Bot."
+    )
+
+    embed.add_field(
+        name="🛠 Utility",
+        value=(
+            "`/ping`\n"
+            "`/help`\n"
+            "`/serverinfo`\n"
+            "`/userinfo`\n"
+            "`/avatar`"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="🔨 Moderation",
+        value=(
+            "`/ban`\n"
+            "`/kick`\n"
+            "`/timeout`\n"
+            "`/warn`\n"
+            "`/warnings`\n"
+            "`/clear`\n"
+            "`/lock`\n"
+            "`/unlock`"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="📢 Server Tools",
+        value=(
+            "`/embed`\n"
+            "`/announce`\n"
+            "`/say`"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="🎉 Giveaways",
+        value="`/giveaway`",
+        inline=True
+    )
+
+    embed.add_field(
+        name="🏴‍☠️ BFC",
+        value=(
+            "`/profile`\n"
+            "`/setprofile`\n"
+            "`/bounty`\n"
+            "`/verify`"
+        ),
+        inline=True
+    )
+
+    embed.set_footer(
+        text="Blox Fruits Community • BFC Bot"
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# =========================================================
+# SERVER INFO
+# =========================================================
 
 @bot.tree.command(
     name="serverinfo",
-    description="Show information about this server."
+    description="Show information about the server."
 )
-async def serverinfo(interaction: discord.Interaction):
+async def serverinfo(interaction):
 
     guild = interaction.guild
 
     if not guild:
+
         return await interaction.response.send_message(
-            "This command can only be used inside a server.",
+            "❌ This command can only be used in a server.",
             ephemeral=True
         )
 
-    e = make_embed(
-        f"🏴 {guild.name}",
-        f"**Owner:** {guild.owner.mention if guild.owner else 'Unknown'}"
+    embed = make_embed(
+        f"🏴‍☠️ {guild.name}",
+        f"Server ID: `{guild.id}`"
     )
 
-    e.add_field(
+    embed.add_field(
         name="👥 Members",
         value=str(guild.member_count),
         inline=True
     )
 
-    e.add_field(
+    embed.add_field(
         name="💬 Channels",
         value=str(len(guild.channels)),
         inline=True
     )
 
-    e.add_field(
+    embed.add_field(
         name="🎭 Roles",
         value=str(len(guild.roles)),
         inline=True
     )
 
-    e.add_field(
-        name="🆔 Server ID",
-        value=f"`{guild.id}`",
-        inline=False
-    )
+    if guild.owner:
+
+        embed.add_field(
+            name="👑 Owner",
+            value=guild.owner.mention,
+            inline=True
+        )
 
     if guild.icon:
-        e.set_thumbnail(url=guild.icon.url)
 
-    await interaction.response.send_message(embed=e)
+        embed.set_thumbnail(
+            url=guild.icon.url
+        )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
 
 
-# ============================================================
-# /USERINFO
-# ============================================================
+# =========================================================
+# USER INFO
+# =========================================================
 
 @bot.tree.command(
     name="userinfo",
     description="Show information about a member."
 )
-@app_commands.describe(member="The member to inspect.")
+@app_commands.describe(
+    member="Member to inspect"
+)
 async def userinfo(
-    interaction: discord.Interaction,
+    interaction,
     member: discord.Member = None
 ):
 
     member = member or interaction.user
 
-    roles = [
-        role.mention
-        for role in member.roles[1:]
-    ]
-
-    roles_text = ", ".join(roles)
-
-    if not roles_text:
-        roles_text = "None"
-
-    if len(roles_text) > 1000:
-        roles_text = roles_text[:1000] + "..."
-
-    e = make_embed(
+    embed = make_embed(
         f"👤 {member.display_name}",
-        f"**Username:** `{member}`\n"
-        f"**ID:** `{member.id}`\n"
-        f"**Mention:** {member.mention}"
+        f"Username: `{member}`"
     )
 
-    if member.joined_at:
-        e.add_field(
-            name="📅 Joined Server",
-            value=discord.utils.format_dt(member.joined_at, "R"),
-            inline=False
-        )
-
-    e.add_field(
-        name="🎭 Roles",
-        value=roles_text,
+    embed.add_field(
+        name="🆔 ID",
+        value=str(member.id),
         inline=False
     )
 
-    e.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(
+        name="📅 Account Created",
+        value=discord.utils.format_dt(
+            member.created_at,
+            "F"
+        ),
+        inline=False
+    )
 
-    await interaction.response.send_message(embed=e)
+    if member.joined_at:
+
+        embed.add_field(
+            name="📥 Joined Server",
+            value=discord.utils.format_dt(
+                member.joined_at,
+                "F"
+            ),
+            inline=False
+        )
+
+    embed.set_thumbnail(
+        url=member.display_avatar.url
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
 
 
-# ============================================================
-# /AVATAR
-# ============================================================
+# =========================================================
+# AVATAR
+# =========================================================
 
 @bot.tree.command(
     name="avatar",
     description="Show a member's avatar."
 )
-@app_commands.describe(member="The member whose avatar you want.")
+@app_commands.describe(
+    member="Member whose avatar you want"
+)
 async def avatar(
-    interaction: discord.Interaction,
+    interaction,
     member: discord.Member = None
 ):
 
     member = member or interaction.user
 
-    e = make_embed(
-        f"🖼️ {member.display_name}'s Avatar",
-        f"[Open Avatar]({member.display_avatar.url})"
+    embed = make_embed(
+        "🖼️ Avatar",
+        f"{member.mention}'s avatar"
     )
 
-    e.set_image(url=member.display_avatar.url)
-
-    await interaction.response.send_message(embed=e)
-
-
-# ============================================================
-# /EMBED
-# ============================================================
-
-@bot.tree.command(
-    name="embed",
-    description="Create and send a custom embed as BFC Bot."
-)
-@app_commands.describe(
-    title="Embed title",
-    description="Embed description",
-    color="Hex color, example: 5865F2",
-    image_url="Optional large image URL",
-    image_upload="Upload a large image directly",
-    thumbnail_url="Optional thumbnail URL",
-    thumbnail_upload="Upload a thumbnail directly",
-    footer="Footer text",
-    author="Author text",
-    channel="Channel where the embed will be sent"
-)
-async def embed_command(
-    interaction: discord.Interaction,
-    title: str,
-    description: str,
-    color: str = "5865F2",
-    image_url: str = None,
-    image_upload: discord.Attachment = None,
-    thumbnail_url: str = None,
-    thumbnail_upload: discord.Attachment = None,
-    footer: str = None,
-    author: str = None,
-    channel: discord.TextChannel = None
-):
-
-    if not await staff_check(interaction):
-        return
-
-    color_value = parse_color(color)
-
-    if color_value is None:
-        return await interaction.response.send_message(
-            embed=make_embed(
-                "❌ Invalid Color",
-                "Use a 6-character hex color.\nExample: `5865F2` or `#5865F2`.",
-                ERROR_COLOR
-            ),
-            ephemeral=True
-        )
-
-    channel = channel or interaction.channel
-
-    if not isinstance(channel, discord.TextChannel):
-        return await interaction.response.send_message(
-            "❌ Please select a normal text channel.",
-            ephemeral=True
-        )
-
-    e = discord.Embed(
-        title=title,
-        description=description,
-        color=color_value,
-        timestamp=datetime.now(timezone.utc)
+    embed.set_image(
+        url=member.display_avatar.url
     )
 
-    # MAIN IMAGE
-    if image_upload:
-        e.set_image(url=image_upload.url)
-
-    elif image_url:
-        e.set_image(url=image_url)
-
-    # THUMBNAIL
-    if thumbnail_upload:
-        e.set_thumbnail(url=thumbnail_upload.url)
-
-    elif thumbnail_url:
-        e.set_thumbnail(url=thumbnail_url)
-
-    # FOOTER
-    if footer:
-        e.set_footer(text=footer)
-    else:
-        e.set_footer(text=f"{BOT_NAME} • BFC")
-
-    # AUTHOR
-    if author:
-        e.set_author(name=author)
-
-    try:
-
-        await channel.send(embed=e)
-
-        await interaction.response.send_message(
-            embed=make_embed(
-                "✅ Embed Sent",
-                f"BFC Bot sent your embed to {channel.mention}.",
-                SUCCESS_COLOR
-            ),
-            ephemeral=True
-        )
-
-    except discord.Forbidden:
-
-        await interaction.response.send_message(
-            embed=make_embed(
-                "❌ Missing Permissions",
-                "I cannot send messages or embeds in that channel.",
-                ERROR_COLOR
-            ),
-            ephemeral=True
-        )
-
-
-# ============================================================
-# /ANNOUNCE
-# ============================================================
-
-@bot.tree.command(
-    name="announce",
-    description="Send an announcement as BFC Bot."
-)
-@app_commands.describe(
-    title="Announcement title",
-    message="Announcement message",
-    channel="Channel where it will be sent"
-)
-async def announce(
-    interaction: discord.Interaction,
-    title: str,
-    message: str,
-    channel: discord.TextChannel = None
-):
-
-    if not await staff_check(interaction):
-        return
-
-    channel = channel or interaction.channel
-
-    e = make_embed(
-        f"📢 {title}",
-        message
+    await interaction.response.send_message(
+        embed=embed
     )
 
-    e.set_author(name=f"{BOT_NAME} • Announcement")
 
-    try:
-        await channel.send(embed=e)
-
-        await interaction.response.send_message(
-            "✅ Announcement sent!",
-            ephemeral=True
-        )
-
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "❌ I cannot send messages there.",
-            ephemeral=True
-        )
-
-
-# ============================================================
-# /SAY
-# ============================================================
-
-@bot.tree.command(
-    name="say",
-    description="Send a normal message as BFC Bot."
-)
-@app_commands.describe(
-    message="Message to send",
-    channel="Channel where it will be sent"
-)
-async def say(
-    interaction: discord.Interaction,
-    message: str,
-    channel: discord.TextChannel = None
-):
-
-    if not await staff_check(interaction):
-        return
-
-    channel = channel or interaction.channel
-
-    try:
-
-        await channel.send(message)
-
-        await interaction.response.send_message(
-            "✅ Message sent!",
-            ephemeral=True
-        )
-
-    except discord.Forbidden:
-
-        await interaction.response.send_message(
-            "❌ I cannot send messages there.",
-            ephemeral=True
-        )
-
-
-# ============================================================
-# /BAN
-# ============================================================
+# =========================================================
+# BAN
+# =========================================================
 
 @bot.tree.command(
     name="ban",
@@ -589,45 +525,49 @@ async def say(
     reason="Reason for the ban"
 )
 async def ban(
-    interaction: discord.Interaction,
+    interaction,
     member: discord.Member,
-    reason: str = "No reason provided."
+    reason: str = "No reason provided"
 ):
 
-    if not await staff_check(interaction):
-        return
+    if not staff_check(interaction):
 
-    if member == interaction.user:
         return await interaction.response.send_message(
-            "❌ You cannot ban yourself.",
+            "❌ You don't have permission.",
             ephemeral=True
         )
 
     try:
 
-        await member.ban(reason=reason)
+        await member.ban(
+            reason=reason
+        )
+
+        embed = make_embed(
+            "🔨 Member Banned",
+            f"{member.mention} has been banned."
+        )
+
+        embed.add_field(
+            name="Reason",
+            value=reason
+        )
 
         await interaction.response.send_message(
-            embed=make_embed(
-                "🔨 Member Banned",
-                f"**Member:** {member.mention}\n"
-                f"**Reason:** {reason}\n"
-                f"**Moderator:** {interaction.user.mention}",
-                SUCCESS_COLOR
-            )
+            embed=embed
         )
 
     except discord.Forbidden:
 
         await interaction.response.send_message(
-            "❌ I cannot ban that member. Check my role position and permissions.",
+            "❌ I can't ban this member.",
             ephemeral=True
         )
 
 
-# ============================================================
-# /KICK
-# ============================================================
+# =========================================================
+# KICK
+# =========================================================
 
 @bot.tree.command(
     name="kick",
@@ -638,45 +578,49 @@ async def ban(
     reason="Reason for the kick"
 )
 async def kick(
-    interaction: discord.Interaction,
+    interaction,
     member: discord.Member,
-    reason: str = "No reason provided."
+    reason: str = "No reason provided"
 ):
 
-    if not await staff_check(interaction):
-        return
+    if not staff_check(interaction):
 
-    if member == interaction.user:
         return await interaction.response.send_message(
-            "❌ You cannot kick yourself.",
+            "❌ You don't have permission.",
             ephemeral=True
         )
 
     try:
 
-        await member.kick(reason=reason)
+        await member.kick(
+            reason=reason
+        )
+
+        embed = make_embed(
+            "👢 Member Kicked",
+            f"{member.mention} has been kicked."
+        )
+
+        embed.add_field(
+            name="Reason",
+            value=reason
+        )
 
         await interaction.response.send_message(
-            embed=make_embed(
-                "👢 Member Kicked",
-                f"**Member:** {member.mention}\n"
-                f"**Reason:** {reason}\n"
-                f"**Moderator:** {interaction.user.mention}",
-                SUCCESS_COLOR
-            )
+            embed=embed
         )
 
     except discord.Forbidden:
 
         await interaction.response.send_message(
-            "❌ I cannot kick that member.",
+            "❌ I can't kick this member.",
             ephemeral=True
         )
 
 
-# ============================================================
-# /TIMEOUT
-# ============================================================
+# =========================================================
+# TIMEOUT
+# =========================================================
 
 @bot.tree.command(
     name="timeout",
@@ -688,24 +632,32 @@ async def kick(
     reason="Reason"
 )
 async def timeout(
-    interaction: discord.Interaction,
+    interaction,
     member: discord.Member,
     minutes: int,
-    reason: str = "No reason provided."
+    reason: str = "No reason provided"
 ):
 
-    if not await staff_check(interaction):
-        return
+    if not staff_check(interaction):
 
-    if minutes < 1 or minutes > 40320:
         return await interaction.response.send_message(
-            "❌ Duration must be between 1 minute and 28 days.",
+            "❌ You don't have permission.",
             ephemeral=True
         )
 
-    until = discord.utils.utcnow() + timedelta(minutes=minutes)
+    if minutes < 1 or minutes > 40320:
+
+        return await interaction.response.send_message(
+            "❌ Timeout must be between 1 minute and 28 days.",
+            ephemeral=True
+        )
 
     try:
+
+        until = (
+            discord.utils.utcnow()
+            + timedelta(minutes=minutes)
+        )
 
         await member.timeout(
             until,
@@ -713,26 +665,20 @@ async def timeout(
         )
 
         await interaction.response.send_message(
-            embed=make_embed(
-                "⏳ Member Timed Out",
-                f"**Member:** {member.mention}\n"
-                f"**Duration:** `{minutes}` minutes\n"
-                f"**Reason:** {reason}",
-                SUCCESS_COLOR
-            )
+            f"⏳ {member.mention} was timed out for **{minutes} minutes**."
         )
 
     except discord.Forbidden:
 
         await interaction.response.send_message(
-            "❌ I cannot timeout that member.",
+            "❌ I can't timeout this member.",
             ephemeral=True
         )
 
 
-# ============================================================
-# /WARN
-# ============================================================
+# =========================================================
+# WARN
+# =========================================================
 
 @bot.tree.command(
     name="warn",
@@ -740,432 +686,741 @@ async def timeout(
 )
 @app_commands.describe(
     member="Member to warn",
-    reason="Reason for the warning"
+    reason="Warning reason"
 )
 async def warn(
-    interaction: discord.Interaction,
+    interaction,
     member: discord.Member,
     reason: str
 ):
 
-    if not await staff_check(interaction):
-        return
+    if not staff_check(interaction):
 
-    key = user_key(interaction.guild.id, member.id)
+        return await interaction.response.send_message(
+            "❌ You don't have permission.",
+            ephemeral=True
+        )
 
-    data["warnings"].setdefault(key, [])
+    warnings = get_warnings(
+        member.id
+    )
 
-    data["warnings"][key].append({
+    warnings.append({
         "reason": reason,
         "moderator": interaction.user.id,
-        "time": datetime.now(timezone.utc).isoformat()
+        "time": datetime.now(
+            timezone.utc
+        ).isoformat()
     })
 
-    save_data()
+    save_data(data)
 
-    warning_count = len(data["warnings"][key])
+    embed = make_embed(
+        "⚠️ Warning Issued",
+        f"{member.mention} has received a warning."
+    )
+
+    embed.add_field(
+        name="Reason",
+        value=reason
+    )
+
+    embed.add_field(
+        name="Total Warnings",
+        value=str(len(warnings))
+    )
 
     await interaction.response.send_message(
-        embed=make_embed(
-            "⚠️ Member Warned",
-            f"**Member:** {member.mention}\n"
-            f"**Reason:** {reason}\n"
-            f"**Total Warnings:** `{warning_count}`",
-            WARNING_COLOR
-        )
+        embed=embed
     )
 
 
-# ============================================================
-# /WARNINGS
-# ============================================================
+# =========================================================
+# WARNINGS
+# =========================================================
 
 @bot.tree.command(
     name="warnings",
     description="View a member's warnings."
 )
-@app_commands.describe(member="Member to check")
+@app_commands.describe(
+    member="Member to inspect"
+)
 async def warnings(
-    interaction: discord.Interaction,
+    interaction,
     member: discord.Member
 ):
 
-    if not await staff_check(interaction):
-        return
+    if not staff_check(interaction):
 
-    key = user_key(interaction.guild.id, member.id)
-
-    warning_list = data["warnings"].get(key, [])
-
-    if not warning_list:
         return await interaction.response.send_message(
-            embed=make_embed(
-                "📋 Warnings",
-                f"{member.mention} has no warnings.",
-                SUCCESS_COLOR
+            "❌ You don't have permission.",
+            ephemeral=True
+        )
+
+    user_warnings = get_warnings(
+        member.id
+    )
+
+    embed = make_embed(
+        f"⚠️ Warnings — {member}",
+        f"Total warnings: **{len(user_warnings)}**"
+    )
+
+    if not user_warnings:
+
+        embed.description = (
+            "This member has no warnings."
+        )
+
+    else:
+
+        for index, warning_data in enumerate(
+            user_warnings[-10:],
+            start=1
+        ):
+
+            embed.add_field(
+                name=f"Warning #{index}",
+                value=warning_data["reason"],
+                inline=False
             )
-        )
 
-    lines = []
-
-    for index, warning in enumerate(warning_list, start=1):
-
-        lines.append(
-            f"**{index}.** {warning['reason']}"
-        )
-
-    description = "\n".join(lines)
-
-    if len(description) > 4000:
-        description = description[:4000] + "\n..."
-
-    e = make_embed(
-        f"📋 Warnings • {member.display_name}",
-        description,
-        WARNING_COLOR
-    )
-
-    e.add_field(
-        name="Total Warnings",
-        value=str(len(warning_list)),
-        inline=False
-    )
-
-    await interaction.response.send_message(embed=e)
-
-
-# ============================================================
-# /CLEAR
-# ============================================================
-
-@bot.tree.command(
-    name="clear",
-    description="Delete messages from this channel."
-)
-@app_commands.describe(amount="Number of messages to delete")
-async def clear(
-    interaction: discord.Interaction,
-    amount: int
-):
-
-    if not await staff_check(interaction):
-        return
-
-    if amount < 1 or amount > 100:
-        return await interaction.response.send_message(
-            "❌ Choose an amount between 1 and 100.",
-            ephemeral=True
-        )
-
-    if not isinstance(interaction.channel, discord.TextChannel):
-        return await interaction.response.send_message(
-            "❌ This command only works in normal text channels.",
-            ephemeral=True
-        )
-
-    await interaction.response.defer(ephemeral=True)
-
-    deleted = await interaction.channel.purge(limit=amount)
-
-    await interaction.followup.send(
-        f"🧹 Deleted `{len(deleted)}` messages.",
+    await interaction.response.send_message(
+        embed=embed,
         ephemeral=True
     )
 
 
-# ============================================================
-# /LOCK
-# ============================================================
+# =========================================================
+# CLEAR
+# =========================================================
+
+@bot.tree.command(
+    name="clear",
+    description="Delete messages from a channel."
+)
+@app_commands.describe(
+    amount="Number of messages to delete"
+)
+async def clear(
+    interaction,
+    amount: int
+):
+
+    if not staff_check(interaction):
+
+        return await interaction.response.send_message(
+            "❌ You don't have permission.",
+            ephemeral=True
+        )
+
+    if amount < 1 or amount > 100:
+
+        return await interaction.response.send_message(
+            "❌ Amount must be between 1 and 100.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    deleted = await interaction.channel.purge(
+        limit=amount
+    )
+
+    await interaction.followup.send(
+        f"🧹 Deleted **{len(deleted)}** messages.",
+        ephemeral=True
+    )
+
+
+# =========================================================
+# LOCK
+# =========================================================
 
 @bot.tree.command(
     name="lock",
     description="Lock the current channel."
 )
-async def lock(interaction: discord.Interaction):
+async def lock(interaction):
 
-    if not await staff_check(interaction):
-        return
+    if not staff_check(interaction):
 
-    if not isinstance(interaction.channel, discord.TextChannel):
         return await interaction.response.send_message(
-            "❌ This command only works in normal text channels.",
+            "❌ You don't have permission.",
             ephemeral=True
         )
 
-    overwrite = interaction.channel.overwrites_for(
+    channel = interaction.channel
+
+    overwrite = channel.overwrites_for(
         interaction.guild.default_role
     )
 
     overwrite.send_messages = False
 
-    await interaction.channel.set_permissions(
+    await channel.set_permissions(
         interaction.guild.default_role,
         overwrite=overwrite
     )
 
     await interaction.response.send_message(
-        embed=make_embed(
-            "🔒 Channel Locked",
-            f"{interaction.channel.mention} is now locked.",
-            WARNING_COLOR
-        )
+        "🔒 This channel has been locked."
     )
 
 
-# ============================================================
-# /UNLOCK
-# ============================================================
+# =========================================================
+# UNLOCK
+# =========================================================
 
 @bot.tree.command(
     name="unlock",
     description="Unlock the current channel."
 )
-async def unlock(interaction: discord.Interaction):
+async def unlock(interaction):
 
-    if not await staff_check(interaction):
-        return
+    if not staff_check(interaction):
 
-    if not isinstance(interaction.channel, discord.TextChannel):
         return await interaction.response.send_message(
-            "❌ This command only works in normal text channels.",
+            "❌ You don't have permission.",
             ephemeral=True
         )
 
-    overwrite = interaction.channel.overwrites_for(
+    channel = interaction.channel
+
+    overwrite = channel.overwrites_for(
         interaction.guild.default_role
     )
 
     overwrite.send_messages = None
 
-    await interaction.channel.set_permissions(
+    await channel.set_permissions(
         interaction.guild.default_role,
         overwrite=overwrite
     )
 
     await interaction.response.send_message(
-        embed=make_embed(
-            "🔓 Channel Unlocked",
-            f"{interaction.channel.mention} is now unlocked.",
-            SUCCESS_COLOR
-        )
+        "🔓 This channel has been unlocked."
     )
 
 
-# ============================================================
-# /PROFILE
-# ============================================================
+# =========================================================
+# EMBED
+# =========================================================
 
 @bot.tree.command(
-    name="profile",
-    description="View a BFC member profile."
-)
-@app_commands.describe(member="Member whose profile you want")
-async def profile(
-    interaction: discord.Interaction,
-    member: discord.Member = None
-):
-
-    member = member or interaction.user
-
-    key = user_key(interaction.guild.id, member.id)
-
-    profile_data = data["profiles"].get(key, {})
-
-    roblox = profile_data.get("roblox", "Not set")
-    fruit = profile_data.get("fruit", "Not set")
-    note = profile_data.get("note", "No profile description.")
-
-    bounty_amount = data["bounties"].get(key, 0)
-
-    e = make_embed(
-        f"🏴 {member.display_name}'s BFC Profile",
-        note
-    )
-
-    e.set_thumbnail(url=member.display_avatar.url)
-
-    e.add_field(
-        name="🎮 Roblox",
-        value=roblox,
-        inline=True
-    )
-
-    e.add_field(
-        name="🍎 Main Fruit",
-        value=fruit,
-        inline=True
-    )
-
-    e.add_field(
-        name="💰 Bounty",
-        value=f"`{bounty_amount:,}`",
-        inline=True
-    )
-
-    await interaction.response.send_message(embed=e)
-
-
-# ============================================================
-# /SETPROFILE
-# ============================================================
-
-@bot.tree.command(
-    name="setprofile",
-    description="Set your BFC profile."
+    name="embed",
+    description="Create a custom embed."
 )
 @app_commands.describe(
-    roblox="Your Roblox username",
-    fruit="Your main Blox Fruit",
-    note="Short description"
+    title="Embed title",
+    description="Embed description",
+    color="Hex color, example: 5865F2",
+    image="Upload the main image",
+    thumbnail="Upload a thumbnail",
+    footer="Footer text",
+    author="Author text",
+    channel="Channel where the embed will be sent"
 )
-async def setprofile(
-    interaction: discord.Interaction,
-    roblox: str,
-    fruit: str,
-    note: str
+async def embed_command(
+    interaction,
+    title: str,
+    description: str,
+    color: str = "5865F2",
+    image: discord.Attachment = None,
+    thumbnail: discord.Attachment = None,
+    footer: str = None,
+    author: str = None,
+    channel: discord.TextChannel = None
 ):
 
-    key = user_key(
-        interaction.guild.id,
-        interaction.user.id
-    )
-
-    data["profiles"][key] = {
-        "roblox": roblox,
-        "fruit": fruit,
-        "note": note
-    }
-
-    save_data()
-
-    await interaction.response.send_message(
-        embed=make_embed(
-            "✅ Profile Updated",
-            "Your BFC profile has been saved.",
-            SUCCESS_COLOR
-        ),
-        ephemeral=True
-    )
-
-
-# ============================================================
-# /BOUNTY
-# ============================================================
-
-@bot.tree.command(
-    name="bounty",
-    description="View or set a BFC bounty."
-)
-@app_commands.describe(
-    member="Member to view or update",
-    amount="New bounty amount (Staff only)"
-)
-async def bounty(
-    interaction: discord.Interaction,
-    member: discord.Member = None,
-    amount: int = None
-):
-
-    member = member or interaction.user
-
-    key = user_key(
-        interaction.guild.id,
-        member.id
-    )
-
-    if amount is not None:
-
-        if not await staff_check(interaction):
-            return
-
-        if amount < 0:
-            return await interaction.response.send_message(
-                "❌ Bounty cannot be negative.",
-                ephemeral=True
-            )
-
-        data["bounties"][key] = amount
-
-        save_data()
+    if not staff_check(interaction):
 
         return await interaction.response.send_message(
-            embed=make_embed(
-                "💰 Bounty Updated",
-                f"**Player:** {member.mention}\n"
-                f"**Bounty:** `{amount:,}`",
-                SUCCESS_COLOR
-            )
+            "❌ You don't have permission to use `/embed`.",
+            ephemeral=True
         )
 
-    current_bounty = data["bounties"].get(key, 0)
-
-    await interaction.response.send_message(
-        embed=make_embed(
-            "🏴 BFC Bounty",
-            f"**Player:** {member.mention}\n"
-            f"**Bounty:** `{current_bounty:,}`"
-        )
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=parse_color(color),
+        timestamp=datetime.now(timezone.utc)
     )
 
+    if image:
 
-# ============================================================
-# ROBLOX LOOKUP
-# ============================================================
+        embed.set_image(
+            url=image.url
+        )
 
-def roblox_lookup(username):
+    if thumbnail:
 
-    url = "https://users.roblox.com/v1/usernames/users"
+        embed.set_thumbnail(
+            url=thumbnail.url
+        )
 
-    body = json.dumps({
-        "usernames": [username],
-        "excludeBannedUsers": False
-    }).encode("utf-8")
+    if footer:
 
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "BFC-Bot"
-        },
-        method="POST"
+        embed.set_footer(
+            text=footer
+        )
+
+    if author:
+
+        embed.set_author(
+            name=author
+        )
+
+    target_channel = (
+        channel
+        or interaction.channel
     )
 
     try:
 
-        with urllib.request.urlopen(
-            request,
-            timeout=10
-        ) as response:
+        await target_channel.send(
+            embed=embed
+        )
 
-            result = json.loads(
-                response.read().decode("utf-8")
+        await interaction.response.send_message(
+            f"✅ Embed sent to {target_channel.mention}.",
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ I don't have permission to send messages there.",
+            ephemeral=True
+        )
+
+
+# =========================================================
+# ANNOUNCE
+# =========================================================
+
+@bot.tree.command(
+    name="announce",
+    description="Send an announcement embed."
+)
+@app_commands.describe(
+    title="Announcement title",
+    message="Announcement message",
+    channel="Channel to send it to"
+)
+async def announce(
+    interaction,
+    title: str,
+    message: str,
+    channel: discord.TextChannel = None
+):
+
+    if not staff_check(interaction):
+
+        return await interaction.response.send_message(
+            "❌ You don't have permission.",
+            ephemeral=True
+        )
+
+    target = (
+        channel
+        or interaction.channel
+    )
+
+    embed = make_embed(
+        f"📢 {title}",
+        message
+    )
+
+    embed.set_footer(
+        text=f"Announcement by {interaction.user}"
+    )
+
+    await target.send(
+        embed=embed
+    )
+
+    await interaction.response.send_message(
+        f"✅ Announcement sent to {target.mention}.",
+        ephemeral=True
+    )
+
+
+# =========================================================
+# SAY
+# =========================================================
+
+@bot.tree.command(
+    name="say",
+    description="Make the bot say something."
+)
+@app_commands.describe(
+    message="Message to send",
+    channel="Channel to send it to"
+)
+async def say(
+    interaction,
+    message: str,
+    channel: discord.TextChannel = None
+):
+
+    if not staff_check(interaction):
+
+        return await interaction.response.send_message(
+            "❌ You don't have permission.",
+            ephemeral=True
+        )
+
+    target = (
+        channel
+        or interaction.channel
+    )
+
+    await target.send(
+        message
+    )
+
+    await interaction.response.send_message(
+        "✅ Message sent.",
+        ephemeral=True
+    )
+
+
+# =========================================================
+# GIVEAWAY
+# =========================================================
+
+class GiveawayView(
+    discord.ui.View
+):
+
+    def __init__(self):
+
+        super().__init__(
+            timeout=None
+        )
+
+        self.entries = set()
+
+    @discord.ui.button(
+        label="Enter Giveaway",
+        emoji="🎉",
+        style=discord.ButtonStyle.primary
+    )
+    async def enter(
+        self,
+        interaction,
+        button
+    ):
+
+        user_id = interaction.user.id
+
+        if user_id in self.entries:
+
+            self.entries.remove(
+                user_id
             )
 
-        if not result.get("data"):
-            return None
+            await interaction.response.send_message(
+                "❌ You left the giveaway.",
+                ephemeral=True
+            )
 
-        return result["data"][0]
+        else:
 
-    except Exception as error:
+            self.entries.add(
+                user_id
+            )
 
-        print(f"Roblox lookup error: {error}")
-        return None
+            await interaction.response.send_message(
+                "🎉 You entered the giveaway!",
+                ephemeral=True
+            )
 
 
-# ============================================================
-# /VERIFY
-# ============================================================
+@bot.tree.command(
+    name="giveaway",
+    description="Start a giveaway."
+)
+@app_commands.describe(
+    prize="Giveaway prize",
+    duration="Duration in seconds",
+    winners="Number of winners"
+)
+async def giveaway(
+    interaction,
+    prize: str,
+    duration: int,
+    winners: int = 1
+):
+
+    if not staff_check(interaction):
+
+        return await interaction.response.send_message(
+            "❌ You don't have permission.",
+            ephemeral=True
+        )
+
+    if duration < 10:
+
+        return await interaction.response.send_message(
+            "❌ Duration must be at least 10 seconds.",
+            ephemeral=True
+        )
+
+    if winners < 1:
+
+        return await interaction.response.send_message(
+            "❌ Winners must be at least 1.",
+            ephemeral=True
+        )
+
+    view = GiveawayView()
+
+    embed = make_embed(
+        "🎉 GIVEAWAY!",
+        f"## {prize}\n\n"
+        f"Click the button below to enter!\n\n"
+        f"⏱️ Duration: **{duration} seconds**\n"
+        f"🏆 Winners: **{winners}**"
+    )
+
+    embed.set_footer(
+        text=f"Hosted by {interaction.user}"
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=view
+    )
+
+    message = await interaction.original_response()
+
+    await asyncio.sleep(
+        duration
+    )
+
+    if not view.entries:
+
+        end_embed = make_embed(
+            "🎉 Giveaway Ended",
+            f"Prize: **{prize}**\n\n"
+            "Nobody entered the giveaway."
+        )
+
+        await message.edit(
+            embed=end_embed,
+            view=None
+        )
+
+        return
+
+    entry_list = list(
+        view.entries
+    )
+
+    random.shuffle(
+        entry_list
+    )
+
+    selected = entry_list[
+        :min(
+            winners,
+            len(entry_list)
+        )
+    ]
+
+    mentions = []
+
+    for user_id in selected:
+
+        user = interaction.guild.get_member(
+            user_id
+        )
+
+        if user:
+
+            mentions.append(
+                user.mention
+            )
+
+    end_embed = make_embed(
+        "🎉 Giveaway Ended!",
+        f"Prize: **{prize}**\n\n"
+        f"Winner(s): "
+        f"{', '.join(mentions) if mentions else 'Unknown'}"
+    )
+
+    await message.edit(
+        embed=end_embed,
+        view=None
+    )
+
+
+# =========================================================
+# BFC PROFILE
+# =========================================================
+
+@bot.tree.command(
+    name="profile",
+    description="View a BFC player profile."
+)
+@app_commands.describe(
+    member="Player to view"
+)
+async def profile(
+    interaction,
+    member: discord.Member = None
+):
+
+    member = (
+        member
+        or interaction.user
+    )
+
+    key = user_key(member)
+
+    profile_data = data["profiles"].get(
+        key,
+        {
+            "fruit": "Not set",
+            "level": "Not set",
+            "main": "Not set",
+            "bio": "No bio set."
+        }
+    )
+
+    embed = make_embed(
+        f"🏴‍☠️ {member.display_name}'s BFC Profile",
+        profile_data["bio"]
+    )
+
+    embed.set_thumbnail(
+        url=member.display_avatar.url
+    )
+
+    embed.add_field(
+        name="🍎 Fruit",
+        value=profile_data["fruit"],
+        inline=True
+    )
+
+    embed.add_field(
+        name="⭐ Level",
+        value=profile_data["level"],
+        inline=True
+    )
+
+    embed.add_field(
+        name="⚔️ Main",
+        value=profile_data["main"],
+        inline=True
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# =========================================================
+# SET PROFILE
+# =========================================================
+
+@bot.tree.command(
+    name="setprofile",
+    description="Set your BFC player profile."
+)
+@app_commands.describe(
+    fruit="Your Blox Fruit",
+    level="Your level",
+    main="Your main",
+    bio="Your profile bio"
+)
+async def setprofile(
+    interaction,
+    fruit: str,
+    level: str,
+    main: str,
+    bio: str
+):
+
+    key = user_key(
+        interaction.user
+    )
+
+    data["profiles"][key] = {
+        "fruit": fruit,
+        "level": level,
+        "main": main,
+        "bio": bio
+    }
+
+    save_data(data)
+
+    await interaction.response.send_message(
+        "✅ Your BFC profile has been updated!",
+        ephemeral=True
+    )
+
+
+# =========================================================
+# BOUNTY
+# =========================================================
+
+@bot.tree.command(
+    name="bounty",
+    description="View a player's BFC bounty."
+)
+@app_commands.describe(
+    member="Player to check"
+)
+async def bounty(
+    interaction,
+    member: discord.Member = None
+):
+
+    member = (
+        member
+        or interaction.user
+    )
+
+    amount = data["bounties"].get(
+        user_key(member),
+        0
+    )
+
+    embed = make_embed(
+        "💰 BFC Bounty",
+        f"{member.mention}'s bounty"
+    )
+
+    embed.add_field(
+        name="🏴‍☠️ Bounty",
+        value=f"**{amount:,}**",
+        inline=False
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# =========================================================
+# VERIFY
+# =========================================================
 
 @bot.tree.command(
     name="verify",
-    description="Verify your Roblox account."
+    description="Verify a Roblox username and get the Verified role."
 )
 @app_commands.describe(
     username="Your Roblox username"
 )
 async def verify(
-    interaction: discord.Interaction,
+    interaction,
     username: str
 ):
 
@@ -1173,309 +1428,120 @@ async def verify(
         ephemeral=True
     )
 
-    roblox_user = await asyncio.to_thread(
-        roblox_lookup,
-        username
-    )
+    try:
 
-    if not roblox_user:
-
-        return await interaction.followup.send(
-            embed=make_embed(
-                "❌ Roblox User Not Found",
-                f"I couldn't find a Roblox account named `{username}`.",
-                ERROR_COLOR
-            ),
-            ephemeral=True
+        encoded = urllib.parse.quote(
+            username
         )
 
-    actual_name = roblox_user["name"]
-    display_name = roblox_user.get(
-        "displayName",
-        actual_name
-    )
-    roblox_id = roblox_user["id"]
+        url = (
+            "https://users.roblox.com/v1/users/search"
+            f"?keyword={encoded}&limit=10"
+        )
 
-    verified_role = discord.utils.find(
-        lambda role: role.name.lower() == "verified",
-        interaction.guild.roles
-    )
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "BFC-Bot"
+            }
+        )
 
-    role_text = "No Verified role is configured."
+        with urllib.request.urlopen(
+            request,
+            timeout=10
+        ) as response:
 
-    if verified_role:
+            result = json.loads(
+                response.read().decode()
+            )
+
+        users = result.get(
+            "data",
+            []
+        )
+
+        found = None
+
+        for user in users:
+
+            if user.get(
+                "name",
+                ""
+            ).lower() == username.lower():
+
+                found = user
+                break
+
+        if not found:
+
+            return await interaction.followup.send(
+                "❌ Roblox username not found.",
+                ephemeral=True
+            )
+
+        role = discord.utils.get(
+            interaction.guild.roles,
+            name="Verified"
+        )
+
+        if not role:
+
+            return await interaction.followup.send(
+                "❌ The `Verified` role doesn't exist.",
+                ephemeral=True
+            )
 
         try:
 
             await interaction.user.add_roles(
-                verified_role,
+                role,
                 reason="BFC Roblox verification"
             )
 
-            role_text = f"Role assigned: {verified_role.mention}"
-
         except discord.Forbidden:
 
-            role_text = (
-                "The Verified role exists, but I cannot assign it."
+            return await interaction.followup.send(
+                "❌ I can't assign the Verified role. "
+                "Make sure my bot role is above it.",
+                ephemeral=True
             )
 
-    key = user_key(
-        interaction.guild.id,
-        interaction.user.id
-    )
-
-    data["profiles"].setdefault(key, {})
-
-    data["profiles"][key]["roblox"] = actual_name
-
-    save_data()
-
-    await interaction.followup.send(
-        embed=make_embed(
-            "✅ Roblox Verified",
-            f"**Username:** `{actual_name}`\n"
-            f"**Display Name:** `{display_name}`\n"
-            f"**Roblox ID:** `{roblox_id}`\n\n"
-            f"{role_text}",
-            SUCCESS_COLOR
-        ),
-        ephemeral=True
-    )
-
-
-# ============================================================
-# GIVEAWAY BUTTON
-# ============================================================
-
-class GiveawayView(discord.ui.View):
-
-    def __init__(self, message_id):
-        super().__init__(timeout=None)
-
-        self.message_id = message_id
-
-    @discord.ui.button(
-        label="Enter Giveaway",
-        emoji="🎉",
-        style=discord.ButtonStyle.primary,
-        custom_id="bfc_giveaway_enter"
-    )
-    async def enter(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        giveaway = data["giveaways"].get(
-            str(self.message_id)
+        embed = make_embed(
+            "✅ Verification Successful",
+            f"Roblox account: **{found['name']}**\n"
+            f"Roblox ID: `{found['id']}`\n\n"
+            f"{interaction.user.mention} has received {role.mention}."
         )
 
-        if not giveaway:
-
-            return await interaction.response.send_message(
-                "❌ This giveaway no longer exists.",
-                ephemeral=True
-            )
-
-        if giveaway.get("ended"):
-
-            return await interaction.response.send_message(
-                "❌ This giveaway has already ended.",
-                ephemeral=True
-            )
-
-        if interaction.user.id in giveaway["entries"]:
-
-            return await interaction.response.send_message(
-                "You are already entered! 🎉",
-                ephemeral=True
-            )
-
-        giveaway["entries"].append(
-            interaction.user.id
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True
         )
 
-        save_data()
+    except Exception as error:
 
-        await interaction.response.send_message(
-            "🎉 You have entered the giveaway!",
+        print(
+            f"Verification error: {error}"
+        )
+
+        await interaction.followup.send(
+            "❌ Something went wrong while checking Roblox.",
             ephemeral=True
         )
 
 
-# ============================================================
-# END GIVEAWAY
-# ============================================================
-
-async def finish_giveaway(message_id):
-
-    giveaway = data["giveaways"].get(
-        str(message_id)
-    )
-
-    if not giveaway:
-        return
-
-    if giveaway.get("ended"):
-        return
-
-    giveaway["ended"] = True
-
-    save_data()
-
-    channel = bot.get_channel(
-        giveaway["channel_id"]
-    )
-
-    if not channel:
-        return
-
-    try:
-
-        message = await channel.fetch_message(
-            message_id
-        )
-
-    except (discord.NotFound, discord.Forbidden):
-
-        return
-
-    entries = giveaway.get("entries", [])
-
-    if not entries:
-
-        winner_text = "Nobody entered."
-
-    else:
-
-        winner_id = random.choice(entries)
-
-        winner_text = f"<@{winner_id}> 🎉"
-
-    e = make_embed(
-        "🎉 Giveaway Ended",
-        f"## {giveaway['prize']}\n\n"
-        f"**Winner:** {winner_text}\n"
-        f"**Entries:** `{len(entries)}`",
-        SUCCESS_COLOR
-    )
-
-    await message.edit(
-        embed=e,
-        view=None
-    )
-
-
-# ============================================================
-# /GIVEAWAY
-# ============================================================
-
-@bot.tree.command(
-    name="giveaway",
-    description="Start a giveaway."
-)
-@app_commands.describe(
-    prize="Prize for the giveaway",
-    duration="Duration in minutes",
-    channel="Channel where the giveaway will be sent"
-)
-async def giveaway(
-    interaction: discord.Interaction,
-    prize: str,
-    duration: int,
-    channel: discord.TextChannel = None
-):
-
-    if not await staff_check(interaction):
-        return
-
-    if duration < 1 or duration > 10080:
-
-        return await interaction.response.send_message(
-            "❌ Duration must be between 1 minute and 7 days.",
-            ephemeral=True
-        )
-
-    channel = channel or interaction.channel
-
-    if not isinstance(channel, discord.TextChannel):
-
-        return await interaction.response.send_message(
-            "❌ Please select a normal text channel.",
-            ephemeral=True
-        )
-
-    end_time = (
-        datetime.now(timezone.utc)
-        + timedelta(minutes=duration)
-    )
-
-    e = make_embed(
-        "🎉 BFC GIVEAWAY",
-        f"## {prize}\n\n"
-        "Click the button below to enter!\n\n"
-        f"**Ends:** {discord.utils.format_dt(end_time, 'R')}\n"
-        f"**Hosted by:** {interaction.user.mention}"
-    )
-
-    message = await channel.send(
-        embed=e
-    )
-
-    view = GiveawayView(
-        message.id
-    )
-
-    await message.edit(
-        view=view
-    )
-
-    data["giveaways"][str(message.id)] = {
-        "channel_id": channel.id,
-        "prize": prize,
-        "entries": [],
-        "ended": False,
-        "end_time": end_time.isoformat()
-    }
-
-    save_data()
-
-    await interaction.response.send_message(
-        embed=make_embed(
-            "✅ Giveaway Created",
-            f"Your giveaway was created in {channel.mention}.",
-            SUCCESS_COLOR
-        ),
-        ephemeral=True
-    )
-
-    await asyncio.sleep(
-        duration * 60
-    )
-
-    await finish_giveaway(
-        message.id
-    )
-
-
-# ============================================================
+# =========================================================
 # ERROR HANDLER
-# ============================================================
+# =========================================================
 
 @bot.tree.error
 async def on_app_command_error(
-    interaction: discord.Interaction,
+    interaction,
     error
 ):
 
-    print(f"Command error: {repr(error)}")
-
-    error_embed = make_embed(
-        "❌ Something Went Wrong",
-        "The command could not be completed.\n"
-        "Please check the options and try again.",
-        ERROR_COLOR
+    print(
+        f"Command error: {error}"
     )
 
     try:
@@ -1483,26 +1549,35 @@ async def on_app_command_error(
         if interaction.response.is_done():
 
             await interaction.followup.send(
-                embed=error_embed,
+                "❌ An error occurred while running that command.",
                 ephemeral=True
             )
 
         else:
 
             await interaction.response.send_message(
-                embed=error_embed,
+                "❌ An error occurred while running that command.",
                 ephemeral=True
             )
 
-    except Exception as followup_error:
+    except Exception:
 
-        print(
-            f"Error handler failed: {followup_error}"
-        )
+        pass
 
 
-# ============================================================
-# START BFC BOT
-# ============================================================
+# =========================================================
+# START
+# =========================================================
 
-bot.run(TOKEN)
+if __name__ == "__main__":
+
+    print("Starting BFC Bot...")
+
+    web_thread = threading.Thread(
+        target=run_web_server,
+        daemon=True
+    )
+
+    web_thread.start()
+
+    bot.run(TOKEN)
