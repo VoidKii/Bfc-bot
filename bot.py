@@ -6,12 +6,16 @@ import threading
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+from functools import wraps
+from urllib.parse import urlencode
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-from flask import Flask
+from flask import Flask, render_template, session, redirect, url_for, request as flask_request, jsonify
+from flask_session import Session
+import requests
 
 
 # =========================================================
@@ -25,34 +29,34 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 DATA_FILE = "bfc_data.json"
 
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:10000")
+OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:10000/callback")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "your-secret-key")
+
+DISCORD_API_BASE = "https://discord.com/api/v10"
+
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing from .env")
+
+if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
+    print("⚠️ Warning: DISCORD_CLIENT_ID or DISCORD_CLIENT_SECRET not set. Dashboard OAuth will not work.")
 
 
 # =========================================================
 # FAKE WEB SERVER FOR RENDER
 # =========================================================
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder="templates")
+app.config["SECRET_KEY"] = SESSION_SECRET
+app.config["SESSION_TYPE"] = "filesystem"
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)
 
+Session(app)
 
-@app.route("/")
-def home():
-    return "BFC Bot is online! 🏴‍☠️"
-
-
-@app.route("/health")
-def health():
-    return "OK"
-
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+# Global bot reference for dashboard access
+bot_instance = None
 
 
 # =========================================================
@@ -205,12 +209,502 @@ def get_warnings(user_id):
     return data["warnings"][key]
 
 
+def escape_html(text):
+    """Escape HTML special characters"""
+    if not isinstance(text, str):
+        text = str(text)
+    return (text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#x27;"))
+
+
+def get_discord_oauth_url():
+    """Generate Discord OAuth login URL"""
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify guilds"
+    }
+    return f"https://discord.com/api/oauth2/authorize?{urlencode(params)}"
+
+
+def exchange_code_for_token(code):
+    """Exchange authorization code for access token"""
+    data = {
+        "client_id": DISCORD_CLIENT_ID,
+        "client_secret": DISCORD_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": OAUTH_REDIRECT_URI
+    }
+    
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    
+    response = requests.post(
+        f"{DISCORD_API_BASE}/oauth2/token",
+        data=data,
+        headers=headers,
+        timeout=10
+    )
+    
+    if response.status_code == 200:
+        return response.json()
+    return None
+
+
+def get_discord_user(access_token):
+    """Fetch user data from Discord"""
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+    
+    response = requests.get(
+        f"{DISCORD_API_BASE}/users/@me",
+        headers=headers,
+        timeout=10
+    )
+    
+    if response.status_code == 200:
+        return response.json()
+    return None
+
+
+def get_discord_guilds(access_token):
+    """Fetch user's guilds from Discord"""
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+    
+    response = requests.get(
+        f"{DISCORD_API_BASE}/users/@me/guilds",
+        headers=headers,
+        timeout=10
+    )
+    
+    if response.status_code == 200:
+        return response.json()
+    return []
+
+
+def can_manage_guild(guild_data):
+    """Check if user has admin permissions in guild"""
+    permissions = guild_data.get("permissions", 0)
+    # Administrator permission is bit 3 (value 8)
+    # Manage Guild permission is bit 5 (value 32)
+    return (permissions & 8) or (permissions & 32) or guild_data.get("owner", False)
+
+
+def require_login(f):
+    """Decorator to require dashboard login"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("landing"))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def require_guild_access(f):
+    """Decorator to require guild access"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("landing"))
+        
+        guild_id = flask_request.args.get("guild_id") or flask_request.form.get("guild_id")
+        if not guild_id:
+            return redirect(url_for("dashboard"))
+        
+        # Check if user has access to this guild
+        manageable_guilds = session.get("manageable_guilds", [])
+        if not any(str(g["id"]) == str(guild_id) for g in manageable_guilds):
+            return redirect(url_for("dashboard"))
+        
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+# =========================================================
+# FLASK DASHBOARD ROUTES
+# =========================================================
+
+@app.route("/")
+def landing():
+    """Landing page"""
+    if "user" in session:
+        return redirect(url_for("dashboard"))
+    
+    login_url = get_discord_oauth_url()
+    return render_template("landing.html", login_url=login_url)
+
+
+@app.route("/login")
+def login():
+    """Redirect to Discord OAuth"""
+    if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
+        return "OAuth not configured", 500
+    
+    return redirect(get_discord_oauth_url())
+
+
+@app.route("/callback")
+def callback():
+    """Discord OAuth callback"""
+    code = flask_request.args.get("code")
+    
+    if not code:
+        return redirect(url_for("landing"))
+    
+    # Exchange code for token
+    token_data = exchange_code_for_token(code)
+    
+    if not token_data:
+        return redirect(url_for("landing"))
+    
+    access_token = token_data.get("access_token")
+    
+    # Get user data
+    user_data = get_discord_user(access_token)
+    
+    if not user_data:
+        return redirect(url_for("landing"))
+    
+    # Get user's guilds
+    guilds = get_discord_guilds(access_token)
+    
+    # Filter to only manageable guilds
+    manageable_guilds = [g for g in guilds if can_manage_guild(g)]
+    
+    # Store in session (don't store the access token on client)
+    session.permanent = True
+    session["user"] = {
+        "id": user_data.get("id"),
+        "username": user_data.get("username"),
+        "avatar": user_data.get("avatar")
+    }
+    session["manageable_guilds"] = manageable_guilds
+    
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/logout")
+def logout():
+    """Logout user"""
+    session.clear()
+    return redirect(url_for("landing"))
+
+
+@app.route("/dashboard")
+@require_login
+def dashboard():
+    """Main dashboard - server selection"""
+    manageable_guilds = session.get("manageable_guilds", [])
+    user = session.get("user", {})
+    
+    return render_template(
+        "dashboard.html",
+        manageable_guilds=manageable_guilds,
+        user=user,
+        page="overview"
+    )
+
+
+@app.route("/dashboard/overview")
+@require_login
+@require_guild_access
+def dashboard_overview():
+    """Dashboard overview page"""
+    guild_id = flask_request.args.get("guild_id")
+    manageable_guilds = session.get("manageable_guilds", [])
+    user = session.get("user", {})
+    
+    current_guild = next(
+        (g for g in manageable_guilds if str(g["id"]) == str(guild_id)),
+        None
+    )
+    
+    if not current_guild:
+        return redirect(url_for("dashboard"))
+    
+    return render_template(
+        "dashboard.html",
+        manageable_guilds=manageable_guilds,
+        current_guild=current_guild,
+        user=user,
+        page="overview"
+    )
+
+
+@app.route("/dashboard/messages")
+@require_login
+@require_guild_access
+def dashboard_messages():
+    """Dashboard messages page"""
+    guild_id = flask_request.args.get("guild_id")
+    manageable_guilds = session.get("manageable_guilds", [])
+    user = session.get("user", {})
+    
+    current_guild = next(
+        (g for g in manageable_guilds if str(g["id"]) == str(guild_id)),
+        None
+    )
+    
+    if not current_guild:
+        return redirect(url_for("dashboard"))
+    
+    return render_template(
+        "dashboard.html",
+        manageable_guilds=manageable_guilds,
+        current_guild=current_guild,
+        user=user,
+        page="messages"
+    )
+
+
+@app.route("/dashboard/moderation")
+@require_login
+@require_guild_access
+def dashboard_moderation():
+    """Dashboard moderation page"""
+    guild_id = flask_request.args.get("guild_id")
+    manageable_guilds = session.get("manageable_guilds", [])
+    user = session.get("user", {})
+    
+    current_guild = next(
+        (g for g in manageable_guilds if str(g["id"]) == str(guild_id)),
+        None
+    )
+    
+    if not current_guild:
+        return redirect(url_for("dashboard"))
+    
+    return render_template(
+        "dashboard.html",
+        manageable_guilds=manageable_guilds,
+        current_guild=current_guild,
+        user=user,
+        page="moderation"
+    )
+
+
+@app.route("/dashboard/giveaways")
+@require_login
+@require_guild_access
+def dashboard_giveaways():
+    """Dashboard giveaways page"""
+    guild_id = flask_request.args.get("guild_id")
+    manageable_guilds = session.get("manageable_guilds", [])
+    user = session.get("user", {})
+    
+    current_guild = next(
+        (g for g in manageable_guilds if str(g["id"]) == str(guild_id)),
+        None
+    )
+    
+    if not current_guild:
+        return redirect(url_for("dashboard"))
+    
+    return render_template(
+        "dashboard.html",
+        manageable_guilds=manageable_guilds,
+        current_guild=current_guild,
+        user=user,
+        page="giveaways"
+    )
+
+
+@app.route("/dashboard/bfc")
+@require_login
+@require_guild_access
+def dashboard_bfc():
+    """Dashboard BFC section"""
+    guild_id = flask_request.args.get("guild_id")
+    manageable_guilds = session.get("manageable_guilds", [])
+    user = session.get("user", {})
+    
+    current_guild = next(
+        (g for g in manageable_guilds if str(g["id"]) == str(guild_id)),
+        None
+    )
+    
+    if not current_guild:
+        return redirect(url_for("dashboard"))
+    
+    return render_template(
+        "dashboard.html",
+        manageable_guilds=manageable_guilds,
+        current_guild=current_guild,
+        user=user,
+        page="bfc"
+    )
+
+
+@app.route("/dashboard/server")
+@require_login
+@require_guild_access
+def dashboard_server():
+    """Dashboard server info page"""
+    guild_id = flask_request.args.get("guild_id")
+    manageable_guilds = session.get("manageable_guilds", [])
+    user = session.get("user", {})
+    
+    current_guild = next(
+        (g for g in manageable_guilds if str(g["id"]) == str(guild_id)),
+        None
+    )
+    
+    if not current_guild:
+        return redirect(url_for("dashboard"))
+    
+    return render_template(
+        "dashboard.html",
+        manageable_guilds=manageable_guilds,
+        current_guild=current_guild,
+        user=user,
+        page="server"
+    )
+
+
+# =========================================================
+# API ENDPOINTS
+# =========================================================
+
+@app.route("/api/status")
+@require_login
+def api_status():
+    """Get bot status"""
+    global bot_instance
+    
+    if not bot_instance:
+        return jsonify({"error": "Bot not ready"}), 503
+    
+    return jsonify({
+        "online": bot_instance.user is not None,
+        "latency": round(bot_instance.latency * 1000),
+        "guilds": len(bot_instance.guilds),
+        "commands": len(bot_instance.tree._get_all_commands())
+    })
+
+
+@app.route("/api/guild/<guild_id>/info", methods=["GET"])
+@require_login
+@require_guild_access
+def api_guild_info(guild_id):
+    """Get guild info"""
+    global bot_instance
+    
+    if not bot_instance:
+        return jsonify({"error": "Bot not ready"}), 503
+    
+    guild = bot_instance.get_guild(int(guild_id))
+    
+    if not guild:
+        return jsonify({"error": "Guild not found"}), 404
+    
+    return jsonify({
+        "id": str(guild.id),
+        "name": escape_html(guild.name),
+        "icon": guild.icon.url if guild.icon else None,
+        "member_count": guild.member_count,
+        "channel_count": len(guild.channels),
+        "role_count": len(guild.roles),
+        "owner_id": guild.owner_id,
+        "owner": escape_html(guild.owner.display_name) if guild.owner else None
+    })
+
+
+@app.route("/api/guild/<guild_id>/channels", methods=["GET"])
+@require_login
+@require_guild_access
+def api_guild_channels(guild_id):
+    """Get guild channels"""
+    global bot_instance
+    
+    if not bot_instance:
+        return jsonify({"error": "Bot not ready"}), 503
+    
+    guild = bot_instance.get_guild(int(guild_id))
+    
+    if not guild:
+        return jsonify({"error": "Guild not found"}), 404
+    
+    channels = []
+    for channel in guild.text_channels:
+        if isinstance(channel, discord.TextChannel):
+            channels.append({
+                "id": str(channel.id),
+                "name": escape_html(channel.name)
+            })
+    
+    return jsonify({"channels": channels})
+
+
+@app.route("/api/guild/<guild_id>/members", methods=["GET"])
+@require_login
+@require_guild_access
+def api_guild_members(guild_id):
+    """Get guild members"""
+    global bot_instance
+    
+    if not bot_instance:
+        return jsonify({"error": "Bot not ready"}), 503
+    
+    guild = bot_instance.get_guild(int(guild_id))
+    
+    if not guild:
+        return jsonify({"error": "Guild not found"}), 404
+    
+    members = []
+    for member in list(guild.members)[:50]:  # Limit to first 50
+        members.append({
+            "id": str(member.id),
+            "name": escape_html(member.display_name),
+            "avatar": member.display_avatar.url
+        })
+    
+    return jsonify({"members": members})
+
+
+@app.route("/api/guild/<guild_id>/data", methods=["GET"])
+@require_login
+@require_guild_access
+def api_guild_data(guild_id):
+    """Get BFC data statistics"""
+    return jsonify({
+        "warnings": len(data.get("warnings", {})),
+        "profiles": len(data.get("profiles", {})),
+        "bounties": len(data.get("bounties", {})),
+        "giveaways": len(data.get("giveaways", {}))
+    })
+
+
+@app.route("/health")
+def health():
+    return "OK"
+
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
+
+
 # =========================================================
 # READY
 # =========================================================
 
 @bot.event
 async def on_ready():
+    global bot_instance
+    bot_instance = bot
 
     print("========================================")
     print(f"Logged in as {bot.user}")
@@ -1571,7 +2065,7 @@ async def on_app_command_error(
 
 if __name__ == "__main__":
 
-    print("Starting BFC Bot...")
+    print("Starting BFC Bot with Dashboard...")
 
     web_thread = threading.Thread(
         target=run_web_server,
