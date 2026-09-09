@@ -302,10 +302,18 @@ def get_discord_guilds(access_token):
 
 def can_manage_guild(guild_data):
     """Check if user has admin permissions in guild"""
-    permissions = guild_data.get("permissions", 0)
+    try:
+        permissions = int(guild_data.get("permissions", 0))
+    except (TypeError, ValueError):
+        permissions = 0
+    
     # Administrator permission is bit 3 (value 8)
     # Manage Guild permission is bit 5 (value 32)
-    return (permissions & 8) or (permissions & 32) or guild_data.get("owner", False)
+    return (
+        bool(permissions & 8)
+        or bool(permissions & 32)
+        or bool(guild_data.get("owner", False))
+    )
 
 
 def require_login(f):
